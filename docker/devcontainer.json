@@ -1,0 +1,48 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/ubuntu
+{
+    "name": "TensorFlow C++",
+    "image": "tmc/tensorflow_cc:v2.14.0",
+    // Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+    //"build": {
+    //	"dockerfile": "../docker/Dockerfile",
+    //	"context": ".."
+    //},
+
+    "runArgs": [
+        "--network=host",
+        "--gpus=all",
+        "-v=/data:/data",
+        "-v=/saved_model:/saved_model"
+    ],
+
+    // Features to add to the dev container. More info: https://containers.dev/features.
+    // "features": {},
+
+    // Use 'forwardPorts' to make a list of ports inside the container available locally.
+    // "forwardPorts": [],
+
+    // Use 'postCreateCommand' to run commands after the container is created.
+    "postCreateCommand": "groupadd -g ${localEnv:GROUP_ID} ${localEnv:GROUP_NAME} && useradd -m -s /bin/bash -u ${localEnv:USER_ID} -g ${localEnv:GROUP_ID} ${localEnv:USER_NAME}",
+    "postStartCommand": "su ${localEnv:USER_NAME} && bash",
+
+    // Configure tool-specific properties.
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "eamodio.gitlens",
+                "EditorConfig.EditorConfig",
+                "streetsidesoftware.code-spell-checker",
+                "ms-vscode.cpptools",
+                "ms-python.python",
+                "twxs.cmake",
+                "ms-python.black-formatter",
+                "esbenp.prettier-vscode",
+                "TabNine.tabnine-vscode"
+            ]
+        }
+    }
+
+    // Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
+    //"remoteUser": "shohata"
+}
