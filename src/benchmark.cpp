@@ -21,19 +21,24 @@ using tensorflow::Tensor;
 const std::string image_input_layer = "filename";
 const std::string image_output_layer = "processed_image";
 
-tensorflow::Status CreateImageProcessingGraph(tensorflow::Session *session, const int32_t input_height, const int32_t input_width, const int64_t input_channels, const float input_mean, const float input_std)
+tensorflow::Status CreateImageProcessingGraph(tensorflow::Session *session, const int32_t batch_size, const int32_t input_height, const int32_t input_width, const int64_t input_channels, const float input_mean, const float input_std)
 {
   using namespace tensorflow::ops;
 
   tensorflow::Scope root = tensorflow::Scope::NewRootScope();
+
+  auto image_size = GuaranteeConst(root.WithOpName("image_size"), {input_height, input_width});
+  auto multiples = GuaranteeConst(root.WithOpName("multiples"), {batch_size, 1, 1, 1});
+  auto multiples_int32 = Cast(root.WithOpName("cast_multiples"), multiples, tensorflow::DT_INT32);
 
   auto filename = Placeholder(root.WithOpName(image_input_layer), tensorflow::DT_STRING);
   auto jpeg_image = ReadFile(root.WithOpName("read_file"), filename);
   auto decoded_image = DecodeJpeg(root.WithOpName("decode_jpeg"), jpeg_image, DecodeJpeg::Attrs().Channels(input_channels));
   auto float_image = Cast(root.WithOpName("cast_image"), decoded_image, tensorflow::DT_FLOAT);
   auto expanded_image = ExpandDims(root.WithOpName("expand_dimensions"), float_image, 0);
-  auto resized_image = ResizeBilinear(root.WithOpName("resize_image"), expanded_image, GuaranteeConst(root.WithOpName("size"), {input_height, input_width}));
-  auto output_image = Div(root.WithOpName(image_output_layer), Sub(root.WithOpName("sub"), resized_image, input_mean), input_std);
+  auto resized_image = ResizeBilinear(root.WithOpName("resize_image"), expanded_image, image_size);
+  auto tiled_image = Tile(root.WithOpName("tile_image"), resized_image, multiples_int32);
+  auto output_image = Div(root.WithOpName(image_output_layer), Sub(root.WithOpName("sub"), tiled_image, input_mean), input_std);
 
   // Create Image Processing Graph
   tensorflow::GraphDef graph;
@@ -80,7 +85,7 @@ int main(int argc, char **argv)
   std::string graph_path = "/saved_model/resnet-50";
   int32_t batch_size = 32;
   int32_t num_threads = 4;
-  int32_t num_dirs = 10;
+  int32_t num_dirs = 1;
   int32_t num_files = 1000;
   int32_t input_width = 224;
   int32_t input_height = 224;
@@ -116,7 +121,7 @@ int main(int argc, char **argv)
 
   // Create Image Processing Graph
   std::cout << "Creating image processing graph..." << std::endl;
-  status = CreateImageProcessingGraph(image_session, input_height, input_width, input_channels, input_mean, input_std);
+  status = CreateImageProcessingGraph(image_session, batch_size, input_height, input_width, input_channels, input_mean, input_std);
   if (!status.ok())
   {
     std::cout << "Error creating image processing graph:" << std::endl;
@@ -160,20 +165,6 @@ int main(int argc, char **argv)
     }
   }
 
-  const int32_t num_inputs = images.size() / batch_size;
-  std::vector<Tensor> inputs(num_inputs, Tensor(tensorflow::DT_FLOAT, tensorflow::TensorShape({batch_size, input_height, input_width, input_channels})));
-
-  // Tile the images with batch size
-  std::cout << "Tiling images with batch size..." << std::endl;
-  for (int32_t i = 0; i < num_inputs; i++)
-  {
-    for (int32_t j = 0; j < batch_size; j++)
-    {
-      const auto &image = images[i * batch_size + j].SubSlice(0);
-      inputs[i].SubSlice(j).CopyFrom(image, image.shape());
-    }
-  }
-
   // Load the SavedModel
   tensorflow::SavedModelBundle bundle;
   tensorflow::Session *graph_session;
@@ -189,7 +180,7 @@ int main(int argc, char **argv)
 
   // Warm up the GPU
   std::cout << "Warming up GPU..." << std::endl;
-  for (auto &input : inputs)
+  for (auto &input : images)
   {
     std::vector<Tensor> outputs;
     status = graph_session->Run({{input_layer, input}}, {output_layer}, {}, &outputs);
@@ -203,7 +194,7 @@ int main(int argc, char **argv)
 
   std::chrono::system_clock::time_point start, end;
   std::vector<std::thread> threads;
-  const int total_predictions = num_threads * num_inputs * batch_size;
+  const int total_predictions = num_threads * images.size() * batch_size;
 
   // Run Measurements
   std::cout << "Running measurements..." << std::endl;
@@ -212,7 +203,7 @@ int main(int argc, char **argv)
   {
     threads.emplace_back([&]
                          {
-    for (auto &input : inputs)
+    for (auto &input : images)
     {
       graph_session->Run({{input_layer, input}}, {output_layer}, {}, nullptr);
     } });
