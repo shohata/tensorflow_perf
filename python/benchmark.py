@@ -55,11 +55,12 @@ model.summary()
 print("Warming up GPU...")
 for image, label in parsed_image_dataset:
     for i in range(100):
-        model.predict(image)
+        model.predict(image, verbose=0)
     break
 
 # Create instance for prediction
-tpe = ThreadPoolExecutor(max_workers=4)
+num_workers = 4
+tpe = ThreadPoolExecutor(max_workers=num_workers)
 
 # Inferences
 print("Running measurements...")
@@ -73,8 +74,32 @@ duration = (end - start) / (1000 * 1000)
 throughput = num_images / duration * 1000
 latency = duration / num_images
 
-print("Successfully run the measurement.")
+print("Successfully run the measurement #1.")
+print(f"Workers:            {num_workers:5}")
 print(f"Total predictions:  {num_images:5}")
 print(f"Duration time:      {duration:9.3f} ms")
 print(f"Throughput:         {throughput:9.3f} FPS")
-print(f"Latency:            {latency:9.3f} ms")
+print(f"Latency:            {latency:9.3f} ms\n")
+
+# Create instance for prediction
+num_workers = 4
+tpe = ThreadPoolExecutor(max_workers=num_workers)
+
+# Inferences
+print("Running measurements...")
+start = time.perf_counter_ns()
+for image, label in parsed_image_dataset:
+    tpe.submit(model, image, training=False)
+tpe.shutdown(wait=True)
+end = time.perf_counter_ns()
+
+duration = (end - start) / (1000 * 1000)
+throughput = num_images / duration * 1000
+latency = duration / num_images
+
+print("Successfully run the measurement #2.")
+print(f"Workers:            {num_workers:5}")
+print(f"Total predictions:  {num_images:5}")
+print(f"Duration time:      {duration:9.3f} ms")
+print(f"Throughput:         {throughput:9.3f} FPS")
+print(f"Latency:            {latency:9.3f} ms\n")

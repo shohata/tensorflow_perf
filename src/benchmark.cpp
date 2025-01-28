@@ -5,6 +5,10 @@
 #include <string>
 #include <chrono>
 #include <vector>
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <tensorflow/cc/framework/ops.h>
 #include <tensorflow/cc/framework/scope.h>
 #include <tensorflow/cc/saved_model/loader.h>
@@ -194,21 +198,61 @@ int main(int argc, char **argv)
 
   std::chrono::system_clock::time_point start, end;
   std::vector<std::thread> threads;
-  const int total_predictions = num_threads * images.size() * batch_size;
+  std::condition_variable condition;
+  std::queue<std::function<void()>> job_queue;
+  std::mutex queue_mutex;
+  std::atomic<int> job_counter = 0;
+  std::atomic<bool> complete_flag = false;
+  std::atomic<bool> stop_flag = false;
+  const int total_predictions = images.size() * batch_size;
 
-  // Run Measurements
-  std::cout << "Running measurements..." << std::endl;
-  start = std::chrono::system_clock::now();
+  // Job System
   for (int id = 0; id < num_threads; id++)
   {
     threads.emplace_back([&]
                          {
-    for (auto &input : images)
-    {
-      graph_session->Run({{input_layer, input}}, {output_layer}, {}, nullptr);
+    while (true) {
+      std::function<void()> job;
+
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        condition.wait(lock, [&]
+                      { return !job_queue.empty() || complete_flag; });
+        if(complete_flag && job_queue.empty()){
+          break;
+        }
+
+        job = std::move(job_queue.front());
+        job_queue.pop();
+      }
+
+      job();
+
+      if (job_counter.fetch_sub(1) == 1)
+      {
+        complete_flag.store(true);
+        condition.notify_all();
+      }
     } });
   }
 
+  // Run Measurements
+  std::cout << "Running measurements..." << std::endl;
+  start = std::chrono::system_clock::now();
+  for (auto &input : images)
+  {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex);
+      job_counter.fetch_add(1);
+      complete_flag.store(false);
+
+      job_queue.push([&]
+                     { graph_session->Run({{input_layer, input}}, {output_layer}, {}, nullptr); });
+    }
+    condition.notify_one();
+  }
+
+  // Measurements End
   for (auto &thread : threads)
   {
     thread.join();
