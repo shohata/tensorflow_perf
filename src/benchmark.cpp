@@ -84,6 +84,108 @@ tensorflow::Status LoadSavedModel(const std::string &model_path, tensorflow::Sav
   return ::tensorflow::OkStatus();
 }
 
+void ShowResults(const int measurement, const int total_predictions, const int64_t total_msec)
+{
+  std::cout << "Successfully run the measurement #" << measurement << "." << std::endl;
+  std::cout << "Total predictions: " << total_predictions << std::endl;
+  std::cout << "Duration time: " << total_msec << " ms" << std::endl;
+  std::cout << "Throughput: " << static_cast<float>(total_predictions) / static_cast<float>(total_msec) * 1000.0 << " FPS" << std::endl;
+  std::cout << "Latency: " << static_cast<float>(total_msec) / static_cast<float>(total_predictions) << " ms" << std::endl
+            << std::endl;
+}
+
+class JobManager
+{
+private:
+  std::vector<std::thread> threads;
+  std::condition_variable condition;
+  std::queue<std::function<void()>> job_queue;
+  std::mutex queue_mutex;
+  std::atomic<int> job_counter;
+  std::atomic<bool> complete_flag;
+  std::atomic<bool> stop_flag;
+
+public:
+  JobManager(int32_t num_threads);
+  ~JobManager();
+  void Submit(std::function<void()> job);
+  void Wait();
+
+private:
+  void Worker();
+};
+
+JobManager::JobManager(int32_t num_threads)
+{
+  job_counter.store(0);
+  complete_flag.store(false);
+  stop_flag.store(false);
+
+  for (int id = 0; id < num_threads; id++)
+  {
+    threads.emplace_back([this]
+                         { this->Worker(); });
+  }
+}
+
+JobManager::~JobManager()
+{
+  stop_flag.store(true);
+  condition.notify_all();
+  for (auto &thread : threads)
+  {
+    thread.join();
+  }
+}
+
+void JobManager::Worker()
+{
+  while (true)
+  {
+    std::function<void()> job;
+
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex);
+      condition.wait(lock, [&]
+                     { return !job_queue.empty() || stop_flag; });
+      if (stop_flag && job_queue.empty())
+      {
+        break;
+      }
+
+      job = std::move(job_queue.front());
+      job_queue.pop();
+    }
+
+    job();
+
+    if (job_counter.fetch_sub(1) == 1)
+    {
+      complete_flag.store(true);
+      condition.notify_all();
+    }
+  }
+}
+
+void JobManager::Submit(std::function<void()> job)
+{
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex);
+    job_counter.fetch_add(1);
+    complete_flag.store(false);
+
+    job_queue.push(job);
+  }
+  condition.notify_one();
+}
+
+void JobManager::Wait()
+{
+  std::unique_lock<std::mutex> lock(queue_mutex);
+  condition.wait(lock, [&]
+                 { return complete_flag == true; });
+}
+
 int main(int argc, char **argv)
 {
   std::string graph_path = "/saved_model/resnet-50";
@@ -133,41 +235,33 @@ int main(int argc, char **argv)
     return -1;
   }
 
-  std::vector<std::thread> image_threads;
-  std::vector<tensorflow::Status> image_status(num_dirs);
+  JobManager *job_manager = new JobManager(num_threads);
   std::vector<Tensor> images(num_dirs * num_files);
 
   // Load Images
   std::cout << "Loading images..." << std::endl;
-  for (int32_t id = 0; id < num_dirs; id++)
+  for (int32_t i = 0; i < num_dirs; i++)
   {
-    image_threads.emplace_back([&, id]
-                               {
-    for (int32_t i = 0; i < num_files; i++)
+    for (int32_t j = 0; j < num_files; j++)
     {
-      std::stringstream image_path;
-      image_path << "/data/imagenet2012/image/image-";
-      image_path << std::setfill('0') << std::right << std::setw(4) << id;
-      image_path << "/image-";
-      image_path << std::setfill('0') << std::right << std::setw(4) << i;
-      image_path << ".jpg";
-      image_status[id] = LoadImage(image_session, image_path.str(), &images[id * num_files + i]);
-      if (!image_status[id].ok()) break;
-    } });
-  }
-  for (auto &thread : image_threads)
-  {
-    thread.join();
-  }
-  for (auto &s : image_status)
-  {
-    if (!s.ok())
-    {
-      std::cout << "Error loading images:" << std::endl;
-      std::cout << s.message() << std::endl;
-      return -1;
+      job_manager->Submit([=, &images]
+                          {
+        std::stringstream image_path;
+        image_path << "/data/imagenet2012/image/image-";
+        image_path << std::setfill('0') << std::right << std::setw(4) << i;
+        image_path << "/image-";
+        image_path << std::setfill('0') << std::right << std::setw(4) << j;
+        image_path << ".jpg";
+        tensorflow::Status image_status = LoadImage(image_session, image_path.str(), &images[i * num_files + j]);
+        if (!image_status.ok())
+        {
+          std::cout << "Error loading images:" << std::endl;
+          std::cout << image_status.message() << std::endl;
+        } });
     }
   }
+  job_manager->Wait();
+  delete job_manager;
 
   // Load the SavedModel
   tensorflow::SavedModelBundle bundle;
@@ -184,89 +278,78 @@ int main(int argc, char **argv)
 
   // Warm up the GPU
   std::cout << "Warming up GPU..." << std::endl;
-  for (auto &input : images)
+  job_manager = new JobManager(num_threads);
+  for (auto &image : images)
   {
-    std::vector<Tensor> outputs;
-    status = graph_session->Run({{input_layer, input}}, {output_layer}, {}, &outputs);
-    if (!status.ok())
-    {
-      std::cout << "Error predicting image:" << std::endl;
-      std::cout << status.message() << std::endl;
-      return -1;
-    }
+    Tensor *input = &image;
+    job_manager->Submit([&, input]
+                        {
+      std::vector<Tensor> outputs;
+      status = graph_session->Run({{input_layer, *input}}, {output_layer}, {}, &outputs);
+      if (!status.ok())
+      {
+        std::cout << "Error predicting image:" << std::endl;
+        std::cout << status.message() << std::endl;
+      } });
   }
+  job_manager->Wait();
+  delete job_manager;
 
   std::chrono::system_clock::time_point start, end;
-  std::vector<std::thread> threads;
-  std::condition_variable condition;
-  std::queue<std::function<void()>> job_queue;
-  std::mutex queue_mutex;
-  std::atomic<int> job_counter = 0;
-  std::atomic<bool> complete_flag = false;
-  std::atomic<bool> stop_flag = false;
+  int64_t total_msec;
   const int total_predictions = images.size() * batch_size;
 
-  // Job System
-  for (int id = 0; id < num_threads; id++)
+  // Run Measurements #1
+  std::cout << "Running measurements..." << std::endl;
+  job_manager = new JobManager(num_threads);
+  start = std::chrono::system_clock::now();
+  for (auto &image : images)
   {
-    threads.emplace_back([&]
-                         {
-    while (true) {
-      std::function<void()> job;
-
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        condition.wait(lock, [&]
-                      { return !job_queue.empty() || complete_flag; });
-        if(complete_flag && job_queue.empty()){
-          break;
-        }
-
-        job = std::move(job_queue.front());
-        job_queue.pop();
-      }
-
-      job();
-
-      if (job_counter.fetch_sub(1) == 1)
-      {
-        complete_flag.store(true);
-        condition.notify_all();
-      }
-    } });
+    Tensor *input = &image;
+    job_manager->Submit([&, input]
+                        { graph_session->Run({{input_layer, *input}}, {output_layer}, {}, nullptr); });
   }
+  job_manager->Wait();
+  end = std::chrono::system_clock::now();
+  delete job_manager;
 
-  // Run Measurements
+  total_msec = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+  // Output the Results
+  ShowResults(1, total_predictions, total_msec);
+
+  // Run Measurements #2
+  std::cout << "Running measurements..." << std::endl;
+  job_manager = new JobManager(1);
+  start = std::chrono::system_clock::now();
+  for (auto &image : images)
+  {
+    Tensor *input = &image;
+    job_manager->Submit([&, input]
+                        { graph_session->Run({{input_layer, *input}}, {output_layer}, {}, nullptr); });
+  }
+  job_manager->Wait();
+  end = std::chrono::system_clock::now();
+  delete job_manager;
+
+  total_msec = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+
+  // Output the Results
+  ShowResults(2, total_predictions, total_msec);
+
+  // Run Measurements #3
   std::cout << "Running measurements..." << std::endl;
   start = std::chrono::system_clock::now();
-  for (auto &input : images)
+  for (auto &image : images)
   {
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex);
-      job_counter.fetch_add(1);
-      complete_flag.store(false);
-
-      job_queue.push([&]
-                     { graph_session->Run({{input_layer, input}}, {output_layer}, {}, nullptr); });
-    }
-    condition.notify_one();
-  }
-
-  // Measurements End
-  for (auto &thread : threads)
-  {
-    thread.join();
+    graph_session->Run({{input_layer, image}}, {output_layer}, {}, nullptr);
   }
   end = std::chrono::system_clock::now();
 
-  int64_t total_msec = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+  total_msec = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 
   // Output the Results
-  std::cout << "Successfully run the measurement." << std::endl;
-  std::cout << "Total predictions: " << total_predictions << std::endl;
-  std::cout << "Duration time: " << total_msec << " ms" << std::endl;
-  std::cout << "Throughput: " << static_cast<float>(total_predictions) / static_cast<float>(total_msec) * 1000.0 << " FPS" << std::endl;
-  std::cout << "Latency: " << static_cast<float>(total_msec) / static_cast<float>(total_predictions) << " ms" << std::endl;
+  ShowResults(3, total_predictions, total_msec);
 
   return 0;
 }

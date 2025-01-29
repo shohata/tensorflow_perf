@@ -53,10 +53,19 @@ model.summary()
 
 # Warming Up
 print("Warming up GPU...")
+tpe = ThreadPoolExecutor(max_workers=4)
 for image, label in parsed_image_dataset:
-    for i in range(100):
-        model.predict(image, verbose=0)
-    break
+    tpe.submit(model, image, training=False)
+tpe.shutdown(wait=True)
+
+def show_results(measurement, num_images, duration):
+    throughput = num_images / duration * 1000
+    latency = duration / num_images
+    print(f"Successfully run the measurement #{measurement}.")
+    print(f"Total predictions:  {num_images:5}")
+    print(f"Duration time:      {duration:11.5f} ms")
+    print(f"Throughput:         {throughput:11.5f} FPS")
+    print(f"Latency:            {latency:11.5f} ms\n")
 
 # Create instance for prediction
 num_workers = 4
@@ -71,18 +80,10 @@ tpe.shutdown(wait=True)
 end = time.perf_counter_ns()
 
 duration = (end - start) / (1000 * 1000)
-throughput = num_images / duration * 1000
-latency = duration / num_images
-
-print("Successfully run the measurement #1.")
-print(f"Workers:            {num_workers:5}")
-print(f"Total predictions:  {num_images:5}")
-print(f"Duration time:      {duration:9.3f} ms")
-print(f"Throughput:         {throughput:9.3f} FPS")
-print(f"Latency:            {latency:9.3f} ms\n")
+show_results(1, num_images, duration)
 
 # Create instance for prediction
-num_workers = 4
+num_workers = 1
 tpe = ThreadPoolExecutor(max_workers=num_workers)
 
 # Inferences
@@ -94,12 +95,14 @@ tpe.shutdown(wait=True)
 end = time.perf_counter_ns()
 
 duration = (end - start) / (1000 * 1000)
-throughput = num_images / duration * 1000
-latency = duration / num_images
+show_results(2, num_images, duration)
 
-print("Successfully run the measurement #2.")
-print(f"Workers:            {num_workers:5}")
-print(f"Total predictions:  {num_images:5}")
-print(f"Duration time:      {duration:9.3f} ms")
-print(f"Throughput:         {throughput:9.3f} FPS")
-print(f"Latency:            {latency:9.3f} ms\n")
+# Inferences
+print("Running measurements...")
+start = time.perf_counter_ns()
+for image, label in parsed_image_dataset:
+    model.predict(image, verbose=0)
+end = time.perf_counter_ns()
+
+duration = (end - start) / (1000 * 1000)
+show_results(3, num_images, duration)
